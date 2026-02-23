@@ -247,6 +247,9 @@ class IstaVdmAPI:
         
         Returns:
             Dictionary with flat details or None
+            
+        Raises:
+            IstaVdmAuthError: If authentication is required
         """
         await self._ensure_token_valid()
         
@@ -260,11 +263,15 @@ class IstaVdmAPI:
             flat_url = f"{BASE_URL}/api/flats/{self._flat_id}"
             
             async with session.get(flat_url, headers=headers) as response:
+                if response.status == 401:
+                    _LOGGER.warning("Token invalid (401) getting flat info, re-authenticating")
+                    self._access_token = None
+                    self._refresh_token = None
+                    raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status == 200:
                     flat_data = await response.json()
                     data = flat_data.get('data', {})
                     
-                    # Extract relevant flat information
                     return {
                         'id': data.get('id'),
                         'city': data.get('city'),
@@ -280,6 +287,8 @@ class IstaVdmAPI:
                 else:
                     _LOGGER.warning(f"Failed to get flat info: {response.status}")
                     return None
+        except IstaVdmAuthError:
+            raise
         except Exception as e:
             _LOGGER.error(f"Error getting flat info: {e}")
             return None
@@ -333,6 +342,7 @@ class IstaVdmAPI:
             
         Raises:
             IstaVdmError: If data retrieval fails
+            IstaVdmAuthError: If authentication is required
         """
         await self._ensure_token_valid()
         
@@ -348,6 +358,11 @@ class IstaVdmAPI:
             flat_url = f"{BASE_URL}/api/flats/{self._flat_id}"
             
             async with session.get(flat_url, headers=headers) as response:
+                if response.status == 401:
+                    _LOGGER.warning("Token invalid (401), re-authenticating")
+                    self._access_token = None
+                    self._refresh_token = None
+                    raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
                     raise IstaVdmError(f"Failed to get flat details: {response.status}")
                 
@@ -367,6 +382,11 @@ class IstaVdmAPI:
             _LOGGER.debug(f"Requesting export from: {export_url}")
             
             async with session.get(export_url, headers=headers, allow_redirects=False) as response:
+                if response.status == 401:
+                    _LOGGER.warning("Token invalid (401) on export, re-authenticating")
+                    self._access_token = None
+                    self._refresh_token = None
+                    raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status in (302, 303):
                     # We got redirected to the actual download URL
                     download_url = response.headers.get('Location')
@@ -383,18 +403,27 @@ class IstaVdmAPI:
             
             _LOGGER.debug(f"Downloading CSV from: {download_url}")
             async with session.get(download_url, headers=headers) as response:
+                if response.status == 401:
+                    _LOGGER.warning("Token invalid (401) on download, re-authenticating")
+                    self._access_token = None
+                    self._refresh_token = None
+                    raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
                     raise IstaVdmError(f"Failed to download CSV: {response.status}")
                 
                 csv_content = await response.text()
                 _LOGGER.debug(f"CSV content length: {len(csv_content)}")
+                _LOGGER.debug(f"CSV first 500 chars: {csv_content[:500]}")
             
             # Step 4: Parse the CSV
             return self._parse_csv(csv_content)
             
+        except IstaVdmAuthError:
+            raise
         except aiohttp.ClientError as e:
             raise IstaVdmError(f"Network error: {e}")
         except Exception as e:
+            _LOGGER.exception(f"Error getting consumption data: {e}")
             raise IstaVdmError(f"Error getting consumption data: {e}")
 
     def _parse_csv(self, csv_content: str) -> list[ConsumptionData]:
@@ -409,47 +438,42 @@ class IstaVdmAPI:
         data = []
         
         try:
-            # The CSV has a specific format with metadata and two separate sections
-            # First section: Warmwasser (hot water)
-            # Second section: Wärme (heating)
-            
             lines = csv_content.strip().splitlines()
             reader = csv.reader(lines, delimiter=';')
             
-            # Parse all rows
             rows = list(reader)
+            _LOGGER.debug(f"CSV has {len(rows)} rows")
             
-            # Find sections
-            warmwasser_data = {}  # month -> consumption
-            waerme_data = {}      # month -> consumption
+            warmwasser_data = {}
+            waerme_data = {}
             
             current_section = None
             
-            for row in rows:
+            for i, row in enumerate(rows):
                 if len(row) < 2:
                     continue
                 
-                # Check for section headers
-                if 'Warmwasser' in row[1] or 'warmwasser' in row[1].lower():
+                row_text = row[1] if len(row) > 1 else ""
+                
+                if 'Warmwasser' in row_text or 'warmwasser' in row_text.lower():
                     current_section = 'warmwasser'
+                    _LOGGER.debug(f"Row {i}: Found Warmwasser section")
                     continue
-                elif 'Wärme' in row[1] or 'waerme' in row[1].lower():
+                elif 'Wärme' in row_text or 'waerme' in row_text.lower():
                     current_section = 'waerme'
+                    _LOGGER.debug(f"Row {i}: Found Wärme section")
                     continue
                 
-                # Parse data rows (format: "="Month Year"", "value", "unit"")
                 if current_section and len(row) >= 2:
-                    month_label = row[0].strip('"=')  # Remove quotes and equals
+                    month_label = row[0].strip('"=')
                     value_str = row[1].replace('"', '').replace('=', '')
                     
-                    # Parse German month names
                     month_map = {
-                        'januar': 1, 'februar': 2, 'märz': 3, 'april': 4,
+                        'januar': 1, 'jänner': 1, 'februar': 2, 'märz': 3, 'april': 4,
                         'mai': 5, 'juni': 6, 'juli': 7, 'august': 8,
                         'september': 9, 'oktober': 10, 'november': 11, 'dezember': 12
                     }
                     
-                    # Extract month and year from label like "Februar 2025"
                     month_label_lower = month_label.lower()
                     month_num = None
                     year = None
@@ -457,7 +481,6 @@ class IstaVdmAPI:
                     for month_name, num in month_map.items():
                         if month_name in month_label_lower:
                             month_num = num
-                            # Extract year
                             parts = month_label.split()
                             if len(parts) >= 2:
                                 try:
@@ -468,20 +491,25 @@ class IstaVdmAPI:
                     
                     if month_num and year:
                         try:
-                            # Parse German number format (comma as decimal separator)
-                            value_str = value_str.replace('.', '').replace(',', '.')
-                            value = float(value_str)
+                            value_str_clean = value_str.replace('.', '').replace(',', '.')
+                            value = float(value_str_clean)
                             
                             key = (year, month_num)
                             if current_section == 'warmwasser':
                                 warmwasser_data[key] = value
+                                _LOGGER.debug(f"Parsed hot water: {month_label} -> {value} m³")
                             elif current_section == 'waerme':
                                 waerme_data[key] = value
-                        except ValueError:
-                            pass
+                                _LOGGER.debug(f"Parsed heating: {month_label} -> {value} kWh")
+                        except ValueError as e:
+                            _LOGGER.warning(f"Failed to parse value '{value_str}' for {month_label}: {e}")
+                    elif month_label and current_section:
+                        _LOGGER.debug(f"Could not parse month/year from: {month_label}")
             
-            # Combine data into ConsumptionData objects
             all_months = set(warmwasser_data.keys()) | set(waerme_data.keys())
+            _LOGGER.debug(f"Found {len(all_months)} months of data")
+            _LOGGER.debug(f"Heating data months: {sorted(waerme_data.keys())}")
+            _LOGGER.debug(f"Hot water data months: {sorted(warmwasser_data.keys())}")
             
             for year, month in sorted(all_months):
                 # Calculate period dates
