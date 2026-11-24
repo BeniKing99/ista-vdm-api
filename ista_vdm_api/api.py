@@ -3,14 +3,13 @@
 A Python library for accessing the ista VDM (Verbrauchsdatenmanagement) portal.
 """
 
-import asyncio
+import contextlib
 import csv
 import logging
-import re
 import time
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Any, Optional
+from datetime import date, timedelta
+from types import TracebackType
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -37,28 +36,40 @@ CSV_SECTIONS: tuple[tuple[str, str], ...] = (
 )
 
 MONTH_MAP = {
-    'januar': 1, 'jänner': 1, 'februar': 2, 'märz': 3, 'april': 4,
-    'mai': 5, 'juni': 6, 'juli': 7, 'august': 8,
-    'september': 9, 'oktober': 10, 'november': 11, 'dezember': 12,
+    "januar": 1,
+    "jänner": 1,
+    "februar": 2,
+    "märz": 3,
+    "april": 4,
+    "mai": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "dezember": 12,
 }
 
 
 class IstaVdmAuthError(Exception):
     """Authentication error."""
+
     pass
 
 
 class IstaVdmError(Exception):
     """General ista VDM error."""
+
     pass
 
 
 class IstaVdmAPI:
     """API client for ista VDM."""
 
-    def __init__(self, email: str, password: str, session: Optional[aiohttp.ClientSession] = None):
+    def __init__(self, email: str, password: str, session: aiohttp.ClientSession | None = None):
         """Initialize the API client.
-        
+
         Args:
             email: User email
             password: User password
@@ -67,20 +78,25 @@ class IstaVdmAPI:
         self.email = email
         self.password = password
         self._session = session
-        self._access_token: Optional[str] = None
-        self._refresh_token: Optional[str] = None
-        self._token_expires: Optional[float] = None
-        self._flat_id: Optional[str] = None
+        self._access_token: str | None = None
+        self._refresh_token: str | None = None
+        self._token_expires: float | None = None
+        self._flat_id: str | None = None
         self._flats: list[dict[str, Any]] = []
-        self._user_id: Optional[str] = None
+        self._user_id: str | None = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "IstaVdmAPI":
         """Async context manager entry."""
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Async context manager exit."""
         if self._session is not None:
             await self._session.close()
@@ -94,16 +110,16 @@ class IstaVdmAPI:
 
     async def authenticate(self) -> bool:
         """Authenticate with ista VDM portal.
-        
+
         Returns:
             True if authentication successful
-            
+
         Raises:
             IstaVdmAuthError: If authentication fails
         """
         try:
             session = await self._get_session()
-            
+
             # Step 1: Get the login page to extract the form action URL
             _LOGGER.debug("Step 1: Getting login page")
             params = {
@@ -112,72 +128,80 @@ class IstaVdmAPI:
                 "response_type": "code",
                 "scope": "openid",
             }
-            
+
             async with session.get(LOGIN_URL, params=params, allow_redirects=True) as response:
                 if response.status != 200:
                     raise IstaVdmAuthError(f"Failed to load login page: {response.status}")
-                
+
                 login_page = await response.text()
-                soup = BeautifulSoup(login_page, 'html.parser')
-                
+                soup = BeautifulSoup(login_page, "html.parser")
+
                 # Find the form action (try multiple possible form IDs)
-                form = soup.find('form', {'id': 'kc-form-login'}) or soup.find('form', {'id': 'loginForm'})
+                form = soup.find("form", {"id": "kc-form-login"}) or soup.find(
+                    "form", {"id": "loginForm"}
+                )
                 if not form:
                     # Try finding any form with username/password fields
-                    forms = soup.find_all('form')
+                    forms = soup.find_all("form")
                     for f in forms:
-                        username_input = f.find('input', {'name': 'username'}) or f.find('input', {'id': 'username'})
-                        password_input = f.find('input', {'name': 'password'}) or f.find('input', {'id': 'password'})
+                        username_input = f.find("input", {"name": "username"}) or f.find(
+                            "input", {"id": "username"}
+                        )
+                        password_input = f.find("input", {"name": "password"}) or f.find(
+                            "input", {"id": "password"}
+                        )
                         if username_input and password_input:
                             form = f
                             break
-                    
+
                     if not form:
                         raise IstaVdmAuthError("Login form not found on page")
-                
-                form_action = form.get('action')
+
+                form_action = str(form.get("action") or "")
                 if not form_action:
                     raise IstaVdmAuthError("Form action not found")
-                
+
                 _LOGGER.debug(f"Form action: {form_action}")
-            
+
             # Step 2: Submit login credentials
             _LOGGER.debug("Step 2: Submitting credentials")
             login_data = {
                 "username": self.email,
                 "password": self.password,
             }
-            
-            async with session.post(form_action, data=login_data, allow_redirects=False) as response:
+
+            async with session.post(
+                form_action, data=login_data, allow_redirects=False
+            ) as response:
                 if response.status == 200:
                     # Check for error message
                     error_page = await response.text()
-                    soup = BeautifulSoup(error_page, 'html.parser')
-                    error_span = soup.find('span', {'id': 'input-error'})
+                    soup = BeautifulSoup(error_page, "html.parser")
+                    error_span = soup.find("span", {"id": "input-error"})
                     if error_span:
                         raise IstaVdmAuthError(f"Login failed: {error_span.text.strip()}")
                     raise IstaVdmAuthError("Login failed - unexpected response")
-                
+
                 if response.status not in (302, 303):
                     raise IstaVdmAuthError(f"Unexpected status code: {response.status}")
-                
+
                 # Get the redirect location (contains the authorization code)
-                location = response.headers.get('Location')
+                location = response.headers.get("Location")
                 if not location:
                     raise IstaVdmAuthError("No redirect location found")
-                
+
                 _LOGGER.debug(f"Redirect location: {location}")
-                
+
                 # Extract authorization code from the redirect URL
                 parsed_url = urlparse(location)
                 query_params = parse_qs(parsed_url.query)
-                code = query_params.get('code', [None])[0]
-                
+                code = query_params.get("code", [None])[0]
+
                 if not code:
                     raise IstaVdmAuthError("Authorization code not found in redirect URL")
-                
-                _LOGGER.debug(f"Authorization code obtained")
-            
+
+                _LOGGER.debug("Authorization code obtained")
+
             # Step 4: Exchange code for tokens
             _LOGGER.debug("Step 4: Exchanging code for tokens")
             token_data = {
@@ -186,57 +210,58 @@ class IstaVdmAPI:
                 "code": code,
                 "redirect_uri": f"{BASE_URL}/login-redirect",
             }
-            
+
             async with session.post(TOKEN_URL, data=token_data) as response:
                 if response.status != 200:
                     raise IstaVdmAuthError(f"Failed to obtain tokens: {response.status}")
-                
+
                 token_response = await response.json()
-                self._access_token = token_response.get('access_token')
-                self._refresh_token = token_response.get('refresh_token')
-                expires_in = token_response.get('expires_in', 300)
+                self._access_token = token_response.get("access_token")
+                self._refresh_token = token_response.get("refresh_token")
+                expires_in = token_response.get("expires_in", 300)
                 self._token_expires = time.time() + expires_in
-                
+
                 if not self._access_token:
                     raise IstaVdmAuthError("Access token not received")
-                
+
                 _LOGGER.debug("Authentication successful")
-            
+
             # Step 5: Get user and flat info
             await self._get_user_info()
-            
-            return True
-            
-        except aiohttp.ClientError as e:
-            raise IstaVdmAuthError(f"Network error during authentication: {e}")
-        except Exception as e:
-            raise IstaVdmAuthError(f"Authentication error: {e}")
 
-    async def _get_user_info(self):
+            return True
+
+        except aiohttp.ClientError as e:
+            raise IstaVdmAuthError(f"Network error during authentication: {e}") from e
+        except Exception as e:
+            raise IstaVdmAuthError(f"Authentication error: {e}") from e
+
+    async def _get_user_info(self) -> None:
         """Get user and flat information from the portal."""
         session = await self._get_session()
         headers = {"Authorization": f"Bearer {self._access_token}"}
-        
+
         # Get the main page to extract user info
         async with session.get(f"{BASE_URL}/api/flats", headers=headers) as response:
             if response.status == 200:
                 result = await response.json()
                 _LOGGER.debug(f"Flats response: {result}")
-                
+
                 # Response is wrapped in 'data' key
-                data = result.get('data', result) if isinstance(result, dict) else result
+                data = result.get("data", result) if isinstance(result, dict) else result
                 flats = [
-                    flat for flat in (data or [])
-                    if isinstance(flat, dict) and flat.get('id') is not None
+                    flat
+                    for flat in (data or [])
+                    if isinstance(flat, dict) and flat.get("id") is not None
                 ]
 
                 if flats:
                     # Keep every flat of the account; the first one stays the default
                     self._flats = flats
-                    self._flat_id = str(flats[0].get('id'))
+                    self._flat_id = str(flats[0].get("id"))
                     _LOGGER.debug(f"Found {len(flats)} flat(s): {self.flat_ids}")
                     # Try to extract user ID from various sources
-                    user_id = flats[0].get('userId') or flats[0].get('user_id')
+                    user_id = flats[0].get("userId") or flats[0].get("user_id")
                     if user_id:
                         self._user_id = str(user_id)
                     else:
@@ -246,40 +271,40 @@ class IstaVdmAPI:
                     raise IstaVdmError("No flats found for this user")
             else:
                 raise IstaVdmError(f"Failed to get user info: {response.status}")
-        
+
         _LOGGER.debug(f"Flat ID: {self._flat_id}, User ID: {self._user_id}")
 
-    async def _extract_user_id_from_profile(self) -> Optional[str]:
+    async def _extract_user_id_from_profile(self) -> str | None:
         """Extract user ID from profile page or API."""
         session = await self._get_session()
         headers = {"Authorization": f"Bearer {self._access_token}"}
-        
+
         try:
             async with session.get(f"{BASE_URL}/api/user/profile", headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
-                    user_id = data.get('id') or data.get('userId') or data.get('user_id')
+                    user_id = data.get("id") or data.get("userId") or data.get("user_id")
                     return str(user_id) if user_id else None
         except Exception as e:
             _LOGGER.debug(f"Could not get user profile: {e}")
-        
+
         return None
 
     @staticmethod
     def _normalize_flat(data: dict[str, Any]) -> dict[str, Any]:
         """Reduce a flat record from the portal to the fields this library exposes."""
-        flat_id = data.get('id')
+        flat_id = data.get("id")
         return {
-            'id': str(flat_id) if flat_id is not None else None,
-            'city': data.get('city'),
-            'street': data.get('street'),
-            'housenumber': data.get('housenumber'),
-            'door': data.get('door'),
-            'squaremeter': data.get('squaremeter'),
-            'postalcode': data.get('postalcode'),
-            'flatnumber': data.get('flatnumber'),
-            'floor': data.get('floor'),
-            'property_id': data.get('property_id'),
+            "id": str(flat_id) if flat_id is not None else None,
+            "city": data.get("city"),
+            "street": data.get("street"),
+            "housenumber": data.get("housenumber"),
+            "door": data.get("door"),
+            "squaremeter": data.get("squaremeter"),
+            "postalcode": data.get("postalcode"),
+            "flatnumber": data.get("flatnumber"),
+            "floor": data.get("floor"),
+            "property_id": data.get("property_id"),
         }
 
     async def get_flats(self) -> list[dict[str, Any]]:
@@ -296,13 +321,13 @@ class IstaVdmAPI:
         await self._ensure_token_valid()
         return [self._normalize_flat(flat) for flat in self._flats]
 
-    def _resolve_flat_id(self, flat_id: Optional[str]) -> Optional[str]:
+    def _resolve_flat_id(self, flat_id: str | None) -> str | None:
         """Return the given flat ID, or the default (first) flat of the account."""
         if flat_id is not None:
             return str(flat_id)
         return self._flat_id
 
-    async def get_flat_info(self, flat_id: Optional[str] = None) -> Optional[dict]:
+    async def get_flat_info(self, flat_id: str | None = None) -> dict | None:
         """Get flat information (address, square meters, etc.).
 
         Args:
@@ -325,7 +350,7 @@ class IstaVdmAPI:
             headers = {"Authorization": f"Bearer {self._access_token}"}
 
             flat_url = f"{BASE_URL}/api/flats/{flat_id}"
-            
+
             async with session.get(flat_url, headers=headers) as response:
                 if response.status == 401:
                     _LOGGER.warning("Token invalid (401) getting flat info, re-authenticating")
@@ -334,7 +359,7 @@ class IstaVdmAPI:
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status == 200:
                     flat_data = await response.json()
-                    data = flat_data.get('data', {})
+                    data = flat_data.get("data", {})
 
                     return self._normalize_flat(data)
                 else:
@@ -346,12 +371,12 @@ class IstaVdmAPI:
             _LOGGER.error(f"Error getting flat info: {e}")
             return None
 
-    async def _ensure_token_valid(self):
+    async def _ensure_token_valid(self) -> None:
         """Ensure access token is valid, refresh if needed."""
         if not self._access_token:
             await self.authenticate()
             return
-        
+
         if self._token_expires and time.time() >= self._token_expires - 60:
             # Token is about to expire, try to refresh
             if self._refresh_token:
@@ -359,35 +384,35 @@ class IstaVdmAPI:
             else:
                 await self.authenticate()
 
-    async def _refresh_access_token(self):
+    async def _refresh_access_token(self) -> None:
         """Refresh the access token."""
         try:
             session = await self._get_session()
-            
+
             token_data = {
                 "grant_type": "refresh_token",
                 "client_id": "vdm-frontend",
                 "refresh_token": self._refresh_token,
             }
-            
+
             async with session.post(TOKEN_URL, data=token_data) as response:
                 if response.status != 200:
                     # Refresh failed, re-authenticate
                     await self.authenticate()
                     return
-                
+
                 token_response = await response.json()
-                self._access_token = token_response.get('access_token')
-                self._refresh_token = token_response.get('refresh_token')
-                expires_in = token_response.get('expires_in', 300)
+                self._access_token = token_response.get("access_token")
+                self._refresh_token = token_response.get("refresh_token")
+                expires_in = token_response.get("expires_in", 300)
                 self._token_expires = time.time() + expires_in
-                
+
                 _LOGGER.debug("Token refreshed successfully")
         except Exception as e:
             _LOGGER.warning(f"Token refresh failed: {e}, re-authenticating")
             await self.authenticate()
 
-    async def get_consumption_data(self, flat_id: Optional[str] = None) -> list[ConsumptionData]:
+    async def get_consumption_data(self, flat_id: str | None = None) -> list[ConsumptionData]:
         """Get consumption data from ista VDM.
 
         Args:
@@ -413,7 +438,7 @@ class IstaVdmAPI:
             # Step 1: Get flat details to obtain the export URL from links
             _LOGGER.debug(f"Getting flat details for flat {flat_id}")
             flat_url = f"{BASE_URL}/api/flats/{flat_id}"
-            
+
             async with session.get(flat_url, headers=headers) as response:
                 if response.status == 401:
                     _LOGGER.warning("Token invalid (401), re-authenticating")
@@ -422,22 +447,22 @@ class IstaVdmAPI:
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
                     raise IstaVdmError(f"Failed to get flat details: {response.status}")
-                
+
                 flat_data = await response.json()
                 _LOGGER.debug(f"Flat data: {flat_data}")
-                
+
                 # Extract export URL from links
-                links = flat_data.get('links', {})
-                export_url = links.get('export')
-                
+                links = flat_data.get("links", {})
+                export_url = links.get("export")
+
                 if not export_url:
                     raise IstaVdmError("Export URL not found in flat details")
-                
+
                 _LOGGER.debug(f"Export URL from links: {export_url}")
-            
+
             # Step 2: Request the export (this will redirect to the actual CSV)
             _LOGGER.debug(f"Requesting export from: {export_url}")
-            
+
             async with session.get(export_url, headers=headers, allow_redirects=False) as response:
                 if response.status == 401:
                     _LOGGER.warning("Token invalid (401) on export, re-authenticating")
@@ -446,18 +471,18 @@ class IstaVdmAPI:
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status in (302, 303):
                     # We got redirected to the actual download URL
-                    download_url = response.headers.get('Location')
+                    download_url = response.headers.get("Location")
                     _LOGGER.debug(f"Download URL: {download_url}")
                 elif response.status == 200:
                     # Sometimes the export might be returned directly
                     download_url = export_url
                 else:
                     raise IstaVdmError(f"Failed to get export: {response.status}")
-            
+
             # Step 3: Download the CSV data
             if not download_url:
                 raise IstaVdmError("Download URL not available")
-            
+
             _LOGGER.debug(f"Downloading CSV from: {download_url}")
             async with session.get(download_url, headers=headers) as response:
                 if response.status == 401:
@@ -467,24 +492,24 @@ class IstaVdmAPI:
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
                     raise IstaVdmError(f"Failed to download CSV: {response.status}")
-                
+
                 csv_content = await response.text()
                 _LOGGER.debug(f"CSV content length: {len(csv_content)}")
                 _LOGGER.debug(f"CSV first 500 chars: {csv_content[:500]}")
-            
+
             # Step 4: Parse the CSV
             return self._parse_csv(csv_content)
-            
+
         except IstaVdmAuthError:
             raise
         except aiohttp.ClientError as e:
-            raise IstaVdmError(f"Network error: {e}")
+            raise IstaVdmError(f"Network error: {e}") from e
         except Exception as e:
             _LOGGER.exception(f"Error getting consumption data: {e}")
-            raise IstaVdmError(f"Error getting consumption data: {e}")
+            raise IstaVdmError(f"Error getting consumption data: {e}") from e
 
     @staticmethod
-    def _detect_section(text: str) -> Optional[str]:
+    def _detect_section(text: str) -> str | None:
         """Return the section key for a CSV section header such as 'Kaltwasser in'."""
         lowered = text.lower()
         for keyword, section in CSV_SECTIONS:
@@ -494,19 +519,19 @@ class IstaVdmAPI:
 
     def _parse_csv(self, csv_content: str) -> list[ConsumptionData]:
         """Parse CSV content into ConsumptionData objects.
-        
+
         Args:
             csv_content: CSV content as string
-            
+
         Returns:
             List of ConsumptionData objects
         """
         data = []
-        
+
         try:
             lines = csv_content.strip().splitlines()
-            reader = csv.reader(lines, delimiter=';')
-            
+            reader = csv.reader(lines, delimiter=";")
+
             rows = list(reader)
             _LOGGER.debug(f"CSV has {len(rows)} rows")
 
@@ -514,7 +539,7 @@ class IstaVdmAPI:
                 section: {} for _, section in CSV_SECTIONS
             }
 
-            current_section: Optional[str] = None
+            current_section: str | None = None
 
             for i, row in enumerate(rows):
                 if len(row) < 2:
@@ -535,7 +560,7 @@ class IstaVdmAPI:
                     continue
 
                 if current_section:
-                    value_str = row_text.replace('"', '').replace('=', '')
+                    value_str = row_text.replace('"', "").replace("=", "")
 
                     month_label_lower = month_label.lower()
                     month_num = None
@@ -546,34 +571,34 @@ class IstaVdmAPI:
                             month_num = num
                             parts = month_label.split()
                             if len(parts) >= 2:
-                                try:
+                                with contextlib.suppress(ValueError):
                                     year = int(parts[-1])
-                                except ValueError:
-                                    pass
                             break
 
                     if month_num and year:
                         try:
-                            value_str_clean = value_str.replace('.', '').replace(',', '.')
+                            value_str_clean = value_str.replace(".", "").replace(",", ".")
                             value = float(value_str_clean)
 
                             sections[current_section][(year, month_num)] = value
                             _LOGGER.debug(f"Parsed {current_section}: {month_label} -> {value}")
                         except ValueError as e:
-                            _LOGGER.warning(f"Failed to parse value '{value_str}' for {month_label}: {e}")
+                            _LOGGER.warning(
+                                f"Failed to parse value '{value_str}' for {month_label}: {e}"
+                            )
                     elif month_label:
                         _LOGGER.debug(f"Could not parse month/year from: {month_label}")
 
-            waerme_data = sections['heating']
-            warmwasser_data = sections['hot_water']
-            kaltwasser_data = sections['cold_water']
+            waerme_data = sections["heating"]
+            warmwasser_data = sections["hot_water"]
+            kaltwasser_data = sections["cold_water"]
 
             all_months = set(waerme_data) | set(warmwasser_data) | set(kaltwasser_data)
             _LOGGER.debug(f"Found {len(all_months)} months of data")
             _LOGGER.debug(f"Heating data months: {sorted(waerme_data.keys())}")
             _LOGGER.debug(f"Hot water data months: {sorted(warmwasser_data.keys())}")
             _LOGGER.debug(f"Cold water data months: {sorted(kaltwasser_data.keys())}")
-            
+
             for year, month in sorted(all_months):
                 # Calculate period dates
                 period_start = date(year, month, 1)
@@ -581,7 +606,7 @@ class IstaVdmAPI:
                     period_end = date(year + 1, 1, 1) - timedelta(days=1)
                 else:
                     period_end = date(year, month + 1, 1) - timedelta(days=1)
-                
+
                 consumption = ConsumptionData(
                     period_start=period_start,
                     period_end=period_end,
@@ -593,13 +618,13 @@ class IstaVdmAPI:
                     cold_water_cost=None,
                 )
                 data.append(consumption)
-            
+
             _LOGGER.info(f"Parsed {len(data)} consumption records")
             return data
-            
+
         except Exception as e:
             _LOGGER.error(f"Error parsing CSV: {e}")
-            raise IstaVdmError(f"Failed to parse CSV: {e}")
+            raise IstaVdmError(f"Failed to parse CSV: {e}") from e
 
     @property
     def is_authenticated(self) -> bool:
@@ -607,16 +632,16 @@ class IstaVdmAPI:
         return self._access_token is not None
 
     @property
-    def flat_id(self) -> Optional[str]:
+    def flat_id(self) -> str | None:
         """Get the default (first) flat ID."""
         return self._flat_id
 
     @property
     def flat_ids(self) -> list[str]:
         """Get the IDs of all flats of the account (available after authentication)."""
-        return [str(flat['id']) for flat in self._flats]
+        return [str(flat["id"]) for flat in self._flats]
 
     @property
-    def user_id(self) -> Optional[str]:
+    def user_id(self) -> str | None:
         """Get the user ID."""
         return self._user_id
