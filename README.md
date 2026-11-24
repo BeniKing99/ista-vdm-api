@@ -10,14 +10,15 @@ A Python library for accessing the ista VDM (Verbrauchsdatenmanagement) portal.
 
 ## Overview
 
-This library provides an asynchronous Python interface to retrieve heating and hot water consumption data from the Austrian ista VDM portal (https://ista-vdm.at/).
+This library provides an asynchronous Python interface to retrieve heating, hot water and cold water consumption data from the Austrian ista VDM portal (https://ista-vdm.at/).
 
 ## Features
 
 - 🔄 **Async/Await Support**: Built with `asyncio` and `aiohttp`
 - 🔐 **OAuth2 Authentication**: Secure login via Keycloak
-- 📊 **Consumption Data**: Retrieve heating and hot water usage
+- 📊 **Consumption Data**: Retrieve heating, hot water and cold water usage
 - 🏠 **Flat Information**: Get address, square meters, and property details
+- 🏢 **Multiple Flats**: Access every flat linked to your account
 - 📈 **CSV Parsing**: Automatic parsing of consumption reports
 - 💾 **Session Management**: Automatic token refresh and session handling
 - 📝 **Type Hints**: Fully typed with mypy support
@@ -46,6 +47,7 @@ async def main():
             print(f"Period: {entry.period_start} to {entry.period_end}")
             print(f"Heating: {entry.heating_consumption} kWh")
             print(f"Hot Water: {entry.hot_water_consumption} m³")
+            print(f"Cold Water: {entry.cold_water_consumption} m³")
             print("---")
 
 asyncio.run(main())
@@ -111,6 +113,23 @@ async def analyze_consumption():
         print(f"Latest heating: {latest.heating_consumption} kWh")
 ```
 
+### Multiple Flats
+
+If your account has more than one flat, `get_flats()` lists them all. Pass a
+flat ID to `get_flat_info()` and `get_consumption_data()` to query a specific
+flat; without one, the first flat of the account is used.
+
+```python
+async def all_flats():
+    async with IstaVdmAPI("email@example.com", "password") as api:
+        await api.authenticate()
+
+        for flat in await api.get_flats():
+            info = await api.get_flat_info(flat["id"])
+            data = await api.get_consumption_data(flat["id"])
+            print(f"{info['street']} {info['housenumber']}/{info['door']}: {len(data)} months")
+```
+
 ### Using Custom Session
 
 ```python
@@ -169,8 +188,10 @@ async def authenticate() -> bool
 Retrieve consumption data from the portal.
 
 ```python
-async def get_consumption_data() -> list[ConsumptionData]
+async def get_consumption_data(flat_id: str | None = None) -> list[ConsumptionData]
 ```
+
+- `flat_id`: Flat to query (defaults to the first flat of the account)
 
 **Returns**: List of `ConsumptionData` objects
 
@@ -182,8 +203,10 @@ async def get_consumption_data() -> list[ConsumptionData]
 Get information about the flat/property.
 
 ```python
-async def get_flat_info() -> dict | None
+async def get_flat_info(flat_id: str | None = None) -> dict | None
 ```
+
+- `flat_id`: Flat to query (defaults to the first flat of the account)
 
 **Returns**: Dictionary with flat details or `None` if not available
 
@@ -203,10 +226,23 @@ async def get_flat_info() -> dict | None
 }
 ```
 
+##### `get_flats()`
+
+List all flats of the account.
+
+```python
+async def get_flats() -> list[dict]
+```
+
+**Returns**: List of flat dictionaries with the same keys as `get_flat_info()`.
+The values come from the flat list of the portal, so some fields may be `None`;
+use `get_flat_info(flat_id)` for the full details of one flat.
+
 #### Properties
 
 - `is_authenticated: bool` - Check if client is authenticated
-- `flat_id: str | None` - Get the flat ID
+- `flat_id: str | None` - Get the default (first) flat ID
+- `flat_ids: list[str]` - Get the IDs of all flats of the account
 - `user_id: str | None` - Get the user ID
 
 ### ConsumptionData
@@ -222,7 +258,12 @@ class ConsumptionData:
     heating_cost: float | None
     hot_water_consumption: float | None
     hot_water_cost: float | None
+    cold_water_consumption: float | None = None
+    cold_water_cost: float | None = None
 ```
+
+Fields are `None` when the export of a flat has no data for that type (for
+example, many flats have no separate cold water meter).
 
 ### Exceptions
 

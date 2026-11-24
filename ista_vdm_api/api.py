@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 from .models import ConsumptionData
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +26,21 @@ _LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://ista-vdm.at"
 LOGIN_URL = "https://login.ista.com/realms/vdm/protocol/openid-connect/auth"
 TOKEN_URL = "https://login.ista.com/realms/vdm/protocol/openid-connect/token"
+
+# CSV section headers (matched case-insensitively against the header text) and the
+# consumption type they map to. Order matters: the water sections are checked first.
+CSV_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("kaltwasser", "cold_water"),
+    ("warmwasser", "hot_water"),
+    ("wärme", "heating"),
+    ("waerme", "heating"),
+)
+
+MONTH_MAP = {
+    'januar': 1, 'jänner': 1, 'februar': 2, 'märz': 3, 'april': 4,
+    'mai': 5, 'juni': 6, 'juli': 7, 'august': 8,
+    'september': 9, 'oktober': 10, 'november': 11, 'dezember': 12,
+}
 
 
 class IstaVdmAuthError(Exception):
@@ -56,6 +71,7 @@ class IstaVdmAPI:
         self._refresh_token: Optional[str] = None
         self._token_expires: Optional[float] = None
         self._flat_id: Optional[str] = None
+        self._flats: list[dict[str, Any]] = []
         self._user_id: Optional[str] = None
 
     async def __aenter__(self):
@@ -209,11 +225,18 @@ class IstaVdmAPI:
                 
                 # Response is wrapped in 'data' key
                 data = result.get('data', result) if isinstance(result, dict) else result
-                
-                if data and len(data) > 0:
-                    self._flat_id = str(data[0].get('id'))
+                flats = [
+                    flat for flat in (data or [])
+                    if isinstance(flat, dict) and flat.get('id') is not None
+                ]
+
+                if flats:
+                    # Keep every flat of the account; the first one stays the default
+                    self._flats = flats
+                    self._flat_id = str(flats[0].get('id'))
+                    _LOGGER.debug(f"Found {len(flats)} flat(s): {self.flat_ids}")
                     # Try to extract user ID from various sources
-                    user_id = data[0].get('userId') or data[0].get('user_id')
+                    user_id = flats[0].get('userId') or flats[0].get('user_id')
                     if user_id:
                         self._user_id = str(user_id)
                     else:
@@ -242,25 +265,66 @@ class IstaVdmAPI:
         
         return None
 
-    async def get_flat_info(self) -> Optional[dict]:
-        """Get flat information (address, square meters, etc.).
-        
+    @staticmethod
+    def _normalize_flat(data: dict[str, Any]) -> dict[str, Any]:
+        """Reduce a flat record from the portal to the fields this library exposes."""
+        flat_id = data.get('id')
+        return {
+            'id': str(flat_id) if flat_id is not None else None,
+            'city': data.get('city'),
+            'street': data.get('street'),
+            'housenumber': data.get('housenumber'),
+            'door': data.get('door'),
+            'squaremeter': data.get('squaremeter'),
+            'postalcode': data.get('postalcode'),
+            'flatnumber': data.get('flatnumber'),
+            'floor': data.get('floor'),
+            'property_id': data.get('property_id'),
+        }
+
+    async def get_flats(self) -> list[dict[str, Any]]:
+        """Get all flats that belong to the authenticated account.
+
         Returns:
-            Dictionary with flat details or None
-            
+            List of flat dictionaries (same keys as ``get_flat_info``). The
+            fields come from the flat list endpoint; call ``get_flat_info``
+            with a flat ID for the full details of one flat.
+
         Raises:
             IstaVdmAuthError: If authentication is required
         """
         await self._ensure_token_valid()
-        
-        if not self._flat_id:
+        return [self._normalize_flat(flat) for flat in self._flats]
+
+    def _resolve_flat_id(self, flat_id: Optional[str]) -> Optional[str]:
+        """Return the given flat ID, or the default (first) flat of the account."""
+        if flat_id is not None:
+            return str(flat_id)
+        return self._flat_id
+
+    async def get_flat_info(self, flat_id: Optional[str] = None) -> Optional[dict]:
+        """Get flat information (address, square meters, etc.).
+
+        Args:
+            flat_id: Flat to query. Defaults to the first flat of the account.
+
+        Returns:
+            Dictionary with flat details or None
+
+        Raises:
+            IstaVdmAuthError: If authentication is required
+        """
+        await self._ensure_token_valid()
+
+        flat_id = self._resolve_flat_id(flat_id)
+        if not flat_id:
             return None
-        
+
         try:
             session = await self._get_session()
             headers = {"Authorization": f"Bearer {self._access_token}"}
-            
-            flat_url = f"{BASE_URL}/api/flats/{self._flat_id}"
+
+            flat_url = f"{BASE_URL}/api/flats/{flat_id}"
             
             async with session.get(flat_url, headers=headers) as response:
                 if response.status == 401:
@@ -271,19 +335,8 @@ class IstaVdmAPI:
                 if response.status == 200:
                     flat_data = await response.json()
                     data = flat_data.get('data', {})
-                    
-                    return {
-                        'id': data.get('id'),
-                        'city': data.get('city'),
-                        'street': data.get('street'),
-                        'housenumber': data.get('housenumber'),
-                        'door': data.get('door'),
-                        'squaremeter': data.get('squaremeter'),
-                        'postalcode': data.get('postalcode'),
-                        'flatnumber': data.get('flatnumber'),
-                        'floor': data.get('floor'),
-                        'property_id': data.get('property_id'),
-                    }
+
+                    return self._normalize_flat(data)
                 else:
                     _LOGGER.warning(f"Failed to get flat info: {response.status}")
                     return None
@@ -334,28 +387,32 @@ class IstaVdmAPI:
             _LOGGER.warning(f"Token refresh failed: {e}, re-authenticating")
             await self.authenticate()
 
-    async def get_consumption_data(self) -> list[ConsumptionData]:
+    async def get_consumption_data(self, flat_id: Optional[str] = None) -> list[ConsumptionData]:
         """Get consumption data from ista VDM.
-        
+
+        Args:
+            flat_id: Flat to query. Defaults to the first flat of the account.
+
         Returns:
             List of ConsumptionData objects
-            
+
         Raises:
             IstaVdmError: If data retrieval fails
             IstaVdmAuthError: If authentication is required
         """
         await self._ensure_token_valid()
-        
-        if not self._flat_id:
+
+        flat_id = self._resolve_flat_id(flat_id)
+        if not flat_id:
             raise IstaVdmError("Not properly authenticated - no flat ID available")
-        
+
         try:
             session = await self._get_session()
             headers = {"Authorization": f"Bearer {self._access_token}"}
-            
+
             # Step 1: Get flat details to obtain the export URL from links
-            _LOGGER.debug(f"Getting flat details for flat {self._flat_id}")
-            flat_url = f"{BASE_URL}/api/flats/{self._flat_id}"
+            _LOGGER.debug(f"Getting flat details for flat {flat_id}")
+            flat_url = f"{BASE_URL}/api/flats/{flat_id}"
             
             async with session.get(flat_url, headers=headers) as response:
                 if response.status == 401:
@@ -426,6 +483,15 @@ class IstaVdmAPI:
             _LOGGER.exception(f"Error getting consumption data: {e}")
             raise IstaVdmError(f"Error getting consumption data: {e}")
 
+    @staticmethod
+    def _detect_section(text: str) -> Optional[str]:
+        """Return the section key for a CSV section header such as 'Kaltwasser in'."""
+        lowered = text.lower()
+        for keyword, section in CSV_SECTIONS:
+            if keyword in lowered:
+                return section
+        return None
+
     def _parse_csv(self, csv_content: str) -> list[ConsumptionData]:
         """Parse CSV content into ConsumptionData objects.
         
@@ -443,42 +509,39 @@ class IstaVdmAPI:
             
             rows = list(reader)
             _LOGGER.debug(f"CSV has {len(rows)} rows")
-            
-            warmwasser_data = {}
-            waerme_data = {}
-            
-            current_section = None
-            
+
+            sections: dict[str, dict[tuple[int, int], float]] = {
+                section: {} for _, section in CSV_SECTIONS
+            }
+
+            current_section: Optional[str] = None
+
             for i, row in enumerate(rows):
                 if len(row) < 2:
                     continue
-                
-                row_text = row[1] if len(row) > 1 else ""
-                
-                if 'Warmwasser' in row_text or 'warmwasser' in row_text.lower():
-                    current_section = 'warmwasser'
-                    _LOGGER.debug(f"Row {i}: Found Warmwasser section")
+
+                month_label = row[0].strip().strip('"=').strip()
+                row_text = row[1].strip()
+
+                # Section headers look like ';Kaltwasser in;m³' (empty first column)
+                if not month_label and row_text:
+                    current_section = self._detect_section(row_text)
+                    if current_section:
+                        _LOGGER.debug(f"Row {i}: Found {current_section} section ({row_text})")
+                    else:
+                        # Unknown section: ignore its rows instead of attributing
+                        # them to the previous section.
+                        _LOGGER.debug(f"Row {i}: Skipping unknown section '{row_text}'")
                     continue
-                elif 'Wärme' in row_text or 'waerme' in row_text.lower():
-                    current_section = 'waerme'
-                    _LOGGER.debug(f"Row {i}: Found Wärme section")
-                    continue
-                
-                if current_section and len(row) >= 2:
-                    month_label = row[0].strip('"=')
-                    value_str = row[1].replace('"', '').replace('=', '')
-                    
-                    month_map = {
-                        'januar': 1, 'jänner': 1, 'februar': 2, 'märz': 3, 'april': 4,
-                        'mai': 5, 'juni': 6, 'juli': 7, 'august': 8,
-                        'september': 9, 'oktober': 10, 'november': 11, 'dezember': 12
-                    }
-                    
+
+                if current_section:
+                    value_str = row_text.replace('"', '').replace('=', '')
+
                     month_label_lower = month_label.lower()
                     month_num = None
                     year = None
-                    
-                    for month_name, num in month_map.items():
+
+                    for month_name, num in MONTH_MAP.items():
                         if month_name in month_label_lower:
                             month_num = num
                             parts = month_label.split()
@@ -488,28 +551,28 @@ class IstaVdmAPI:
                                 except ValueError:
                                     pass
                             break
-                    
+
                     if month_num and year:
                         try:
                             value_str_clean = value_str.replace('.', '').replace(',', '.')
                             value = float(value_str_clean)
-                            
-                            key = (year, month_num)
-                            if current_section == 'warmwasser':
-                                warmwasser_data[key] = value
-                                _LOGGER.debug(f"Parsed hot water: {month_label} -> {value} m³")
-                            elif current_section == 'waerme':
-                                waerme_data[key] = value
-                                _LOGGER.debug(f"Parsed heating: {month_label} -> {value} kWh")
+
+                            sections[current_section][(year, month_num)] = value
+                            _LOGGER.debug(f"Parsed {current_section}: {month_label} -> {value}")
                         except ValueError as e:
                             _LOGGER.warning(f"Failed to parse value '{value_str}' for {month_label}: {e}")
-                    elif month_label and current_section:
+                    elif month_label:
                         _LOGGER.debug(f"Could not parse month/year from: {month_label}")
-            
-            all_months = set(warmwasser_data.keys()) | set(waerme_data.keys())
+
+            waerme_data = sections['heating']
+            warmwasser_data = sections['hot_water']
+            kaltwasser_data = sections['cold_water']
+
+            all_months = set(waerme_data) | set(warmwasser_data) | set(kaltwasser_data)
             _LOGGER.debug(f"Found {len(all_months)} months of data")
             _LOGGER.debug(f"Heating data months: {sorted(waerme_data.keys())}")
             _LOGGER.debug(f"Hot water data months: {sorted(warmwasser_data.keys())}")
+            _LOGGER.debug(f"Cold water data months: {sorted(kaltwasser_data.keys())}")
             
             for year, month in sorted(all_months):
                 # Calculate period dates
@@ -525,7 +588,9 @@ class IstaVdmAPI:
                     heating_consumption=waerme_data.get((year, month)),
                     heating_cost=None,
                     hot_water_consumption=warmwasser_data.get((year, month)),
-                    hot_water_cost=None
+                    hot_water_cost=None,
+                    cold_water_consumption=kaltwasser_data.get((year, month)),
+                    cold_water_cost=None,
                 )
                 data.append(consumption)
             
@@ -543,8 +608,13 @@ class IstaVdmAPI:
 
     @property
     def flat_id(self) -> Optional[str]:
-        """Get the flat ID."""
+        """Get the default (first) flat ID."""
         return self._flat_id
+
+    @property
+    def flat_ids(self) -> list[str]:
+        """Get the IDs of all flats of the account (available after authentication)."""
+        return [str(flat['id']) for flat in self._flats]
 
     @property
     def user_id(self) -> Optional[str]:

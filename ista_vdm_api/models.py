@@ -15,7 +15,9 @@ class ConsumptionData:
     heating_cost: Optional[float]
     hot_water_consumption: Optional[float]
     hot_water_cost: Optional[float]
-    
+    cold_water_consumption: Optional[float] = None
+    cold_water_cost: Optional[float] = None
+
     def __post_init__(self):
         """Validate data after initialization."""
         if self.period_end < self.period_start:
