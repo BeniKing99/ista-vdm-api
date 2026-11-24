@@ -52,6 +52,7 @@ write_to = "ista_vdm_api/_version.py"
 [tool.black]
 line-length = 100
 target-version = ['py311']
+extend-exclude = '_version\.py'
 
 [tool.mypy]
 python_version = "3.11"
@@ -68,6 +69,7 @@ show_error_codes = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["ista_vdm_api/_version.py"]
 
 [tool.ruff.lint]
 select = [
