@@ -3,9 +3,17 @@
 from datetime import date
 from typing import Any
 
+import aiohttp
 import pytest
 
-from ista_vdm_api import ConsumptionData, IstaVdmAPI, IstaVdmError
+from ista_vdm_api import (
+    ConsumptionData,
+    IstaVdmAPI,
+    IstaVdmAuthError,
+    IstaVdmConnectionError,
+    IstaVdmError,
+)
+from ista_vdm_api.api import LOGIN_URL, TOKEN_URL
 
 HEATING_AND_COLD_WATER_CSV = '''Adresse:;Adresse;
 LiegenschaftsNr:;123456789;
@@ -110,12 +118,23 @@ def test_consumption_data_cold_water_defaults() -> None:
 
 
 class _FakeResponse:
-    def __init__(self, status: int, payload: Any) -> None:
+    def __init__(
+        self,
+        status: int,
+        payload: Any = None,
+        text: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status = status
         self._payload = payload
+        self._text = text
+        self.headers = headers or {}
 
     async def json(self) -> Any:
         return self._payload
+
+    async def text(self) -> str:
+        return self._text
 
     async def __aenter__(self) -> "_FakeResponse":
         return self
@@ -125,13 +144,47 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, responses: dict[str, _FakeResponse]) -> None:
+    def __init__(self, responses: dict[str, Any]) -> None:
+        # A value is a response, an exception to raise, or a list of them in order
         self._responses = responses
         self.requested: list[str] = []
 
-    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+    def _respond(self, url: str) -> _FakeResponse:
         self.requested.append(url)
-        return self._responses[url]
+        response = self._responses[url]
+        if isinstance(response, list):
+            response = response.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+        return self._respond(url)
+
+    def post(self, url: str, **kwargs: Any) -> _FakeResponse:
+        return self._respond(url)
+
+
+LOGIN_FORM_URL = "https://login.ista.com/realms/vdm/login-actions/authenticate"
+LOGIN_PAGE = (
+    f'<form id="kc-form-login" action="{LOGIN_FORM_URL}">'
+    '<input name="username"><input name="password"></form>'
+)
+WRONG_PASSWORD_PAGE = '<span id="input-error">Invalid username or password.</span>'
+
+
+def _login_session(overrides: dict[str, Any]) -> _FakeSession:
+    """Return a fake session for a successful login, with single steps overridden."""
+    responses: dict[str, Any] = {
+        LOGIN_URL: _FakeResponse(200, text=LOGIN_PAGE),
+        LOGIN_FORM_URL: _FakeResponse(
+            302, headers={"Location": "https://ista-vdm.at/login-redirect?code=abc"}
+        ),
+        TOKEN_URL: _FakeResponse(200, {"access_token": "token", "expires_in": 300}),
+        "https://ista-vdm.at/api/flats": _FakeResponse(200, FLATS_RESPONSE),
+    }
+    responses.update(overrides)
+    return _FakeSession(responses)
 
 
 FLATS_RESPONSE = {
@@ -198,3 +251,111 @@ async def test_no_flats_raises() -> None:
 
     with pytest.raises(IstaVdmError):
         await api._get_user_info()
+
+
+def _api(session: _FakeSession) -> IstaVdmAPI:
+    return IstaVdmAPI("user@example.com", "secret", session=session)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_authenticate_success() -> None:
+    """The full login flow stores the token and discovers the flats."""
+    api = _api(_login_session({}))
+
+    assert await api.authenticate() is True
+    assert api.is_authenticated
+    assert api.flat_ids == ["111", "222"]
+
+
+@pytest.mark.asyncio
+async def test_authenticate_wrong_password_is_auth_error() -> None:
+    """A rejected password is the only case that asks for new credentials."""
+    api = _api(_login_session({LOGIN_FORM_URL: _FakeResponse(200, text=WRONG_PASSWORD_PAGE)}))
+
+    with pytest.raises(IstaVdmAuthError, match="Invalid username or password"):
+        await api.authenticate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "response"),
+    [
+        (LOGIN_URL, aiohttp.ClientConnectionError("Connection refused")),
+        (LOGIN_URL, TimeoutError()),
+        (LOGIN_URL, _FakeResponse(503)),
+        (LOGIN_FORM_URL, _FakeResponse(502)),
+        (TOKEN_URL, _FakeResponse(500)),
+        ("https://ista-vdm.at/api/flats", _FakeResponse(503)),
+    ],
+)
+async def test_authenticate_outage_is_connection_error(
+    url: str, response: _FakeResponse | Exception
+) -> None:
+    """Network errors and server errors of the portal are temporary, not auth errors."""
+    api = _api(_login_session({url: response}))
+
+    with pytest.raises(IstaVdmConnectionError) as exc_info:
+        await api.authenticate()
+    assert not isinstance(exc_info.value, IstaVdmAuthError)
+
+
+@pytest.mark.asyncio
+async def test_authenticate_changed_login_page_is_not_auth_error() -> None:
+    """A login page without the form is a portal change, not a wrong password."""
+    api = _api(_login_session({LOGIN_URL: _FakeResponse(200, text="<html>Maintenance</html>")}))
+
+    with pytest.raises(IstaVdmError) as exc_info:
+        await api.authenticate()
+    assert not isinstance(exc_info.value, (IstaVdmAuthError, IstaVdmConnectionError))
+
+
+@pytest.mark.asyncio
+async def test_consumption_server_error_is_connection_error() -> None:
+    """A server error while fetching consumption data is a connection error."""
+    session = _FakeSession({"https://ista-vdm.at/api/flats/111": _FakeResponse(503)})
+    api = _api(session)
+    api._access_token = "token"
+    api._flat_id = "111"
+
+    with pytest.raises(IstaVdmConnectionError):
+        await api.get_consumption_data()
+
+
+@pytest.mark.asyncio
+async def test_expired_session_token_logs_in_again() -> None:
+    """An expired session token (401) is renewed with the stored credentials."""
+    session = _login_session(
+        {
+            "https://ista-vdm.at/api/flats/111": [
+                _FakeResponse(401),
+                _FakeResponse(200, {"data": {"id": 111, "door": "4"}}),
+            ]
+        }
+    )
+    api = _api(session)
+    api._access_token = "expired"
+    api._flat_id = "111"
+
+    flat = await api.get_flat_info()
+
+    assert flat is not None and flat["door"] == "4"
+    assert session.requested.count(LOGIN_URL) == 1
+    assert api._access_token == "token"
+
+
+@pytest.mark.asyncio
+async def test_expired_session_token_with_changed_password_is_auth_error() -> None:
+    """If the new login is rejected too, the auth error reaches the caller."""
+    session = _login_session(
+        {
+            "https://ista-vdm.at/api/flats/111": _FakeResponse(401),
+            LOGIN_FORM_URL: _FakeResponse(200, text=WRONG_PASSWORD_PAGE),
+        }
+    )
+    api = _api(session)
+    api._access_token = "expired"
+    api._flat_id = "111"
+
+    with pytest.raises(IstaVdmAuthError, match="Invalid username or password"):
+        await api.get_consumption_data()
+    assert session.requested.count(LOGIN_URL) == 1

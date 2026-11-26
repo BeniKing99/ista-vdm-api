@@ -180,7 +180,8 @@ async def authenticate() -> bool
 **Returns**: `True` if authentication successful
 
 **Raises**:
-- `IstaVdmAuthError`: If authentication fails
+- `IstaVdmAuthError`: If the portal rejects the credentials
+- `IstaVdmConnectionError`: If the portal cannot be reached or has a server error
 - `IstaVdmError`: For other errors
 
 ##### `get_consumption_data()`
@@ -269,11 +270,18 @@ example, many flats have no separate cold water meter).
 
 #### `IstaVdmAuthError`
 
-Raised when authentication fails (invalid credentials, expired session, etc.)
+Raised when the portal rejects the credentials or the session token. Asking the
+user for new credentials makes sense only for this error.
 
 #### `IstaVdmError`
 
-General API error (network issues, server errors, parsing errors, etc.)
+General API error (parsing errors, unexpected responses, etc.)
+
+#### `IstaVdmConnectionError`
+
+Subclass of `IstaVdmError`, raised when the portal cannot be reached (network
+error, timeout) or answers with a server error (HTTP 5xx). It is temporary, so
+retry later with the same credentials.
 
 ## Development
 

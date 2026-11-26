@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-26
+
+### Added
+
+- `IstaVdmConnectionError` (a subclass of `IstaVdmError`) for network errors,
+  timeouts and server errors (HTTP 5xx) of the portal
+
+### Changed
+
+- `authenticate()` raises `IstaVdmAuthError` only when the portal rejects the
+  credentials. Network errors and portal outages now raise
+  `IstaVdmConnectionError`, and a changed login page raises `IstaVdmError`, so
+  callers no longer ask for a new password because of a temporary outage
+- `get_flat_info()` and `get_consumption_data()` log in again once with the
+  stored credentials when the portal rejects an expired session token (HTTP
+  401), instead of raising `IstaVdmAuthError`
+
 ## [1.1.0] - 2026-11-24
 
 ### Added

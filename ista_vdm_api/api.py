@@ -7,9 +7,10 @@ import contextlib
 import csv
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 from types import TracebackType
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -17,9 +18,11 @@ from bs4 import BeautifulSoup
 
 from .models import ConsumptionData
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 _LOGGER = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Constants
 BASE_URL = "https://ista-vdm.at"
@@ -53,7 +56,7 @@ MONTH_MAP = {
 
 
 class IstaVdmAuthError(Exception):
-    """Authentication error."""
+    """The portal rejected the credentials or the session token."""
 
     pass
 
@@ -62,6 +65,22 @@ class IstaVdmError(Exception):
     """General ista VDM error."""
 
     pass
+
+
+class IstaVdmConnectionError(IstaVdmError):
+    """The portal could not be reached or answered with a server error.
+
+    These errors are temporary: retrying later can succeed without new credentials.
+    """
+
+    pass
+
+
+def _status_error(status: int, message: str) -> IstaVdmError:
+    """Return the error for an unexpected HTTP status (5xx counts as a connection error)."""
+    if status >= 500:
+        return IstaVdmConnectionError(message)
+    return IstaVdmError(message)
 
 
 class IstaVdmAPI:
@@ -115,7 +134,9 @@ class IstaVdmAPI:
             True if authentication successful
 
         Raises:
-            IstaVdmAuthError: If authentication fails
+            IstaVdmAuthError: If the portal rejects the credentials
+            IstaVdmConnectionError: If the portal cannot be reached or has a server error
+            IstaVdmError: For other errors (for example a changed login page)
         """
         try:
             session = await self._get_session()
@@ -131,7 +152,7 @@ class IstaVdmAPI:
 
             async with session.get(LOGIN_URL, params=params, allow_redirects=True) as response:
                 if response.status != 200:
-                    raise IstaVdmAuthError(f"Failed to load login page: {response.status}")
+                    raise IstaVdmConnectionError(f"Failed to load login page: {response.status}")
 
                 login_page = await response.text()
                 soup = BeautifulSoup(login_page, "html.parser")
@@ -155,11 +176,11 @@ class IstaVdmAPI:
                             break
 
                     if not form:
-                        raise IstaVdmAuthError("Login form not found on page")
+                        raise IstaVdmError("Login form not found on page")
 
                 form_action = str(form.get("action") or "")
                 if not form_action:
-                    raise IstaVdmAuthError("Form action not found")
+                    raise IstaVdmError("Form action not found")
 
                 _LOGGER.debug(f"Form action: {form_action}")
 
@@ -182,6 +203,8 @@ class IstaVdmAPI:
                         raise IstaVdmAuthError(f"Login failed: {error_span.text.strip()}")
                     raise IstaVdmAuthError("Login failed - unexpected response")
 
+                if response.status >= 500:
+                    raise IstaVdmConnectionError(f"Login failed: {response.status}")
                 if response.status not in (302, 303):
                     raise IstaVdmAuthError(f"Unexpected status code: {response.status}")
 
@@ -212,6 +235,8 @@ class IstaVdmAPI:
             }
 
             async with session.post(TOKEN_URL, data=token_data) as response:
+                if response.status >= 500:
+                    raise IstaVdmConnectionError(f"Failed to obtain tokens: {response.status}")
                 if response.status != 200:
                     raise IstaVdmAuthError(f"Failed to obtain tokens: {response.status}")
 
@@ -231,10 +256,12 @@ class IstaVdmAPI:
 
             return True
 
-        except aiohttp.ClientError as e:
-            raise IstaVdmAuthError(f"Network error during authentication: {e}") from e
+        except (IstaVdmAuthError, IstaVdmError):
+            raise
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise IstaVdmConnectionError(f"Network error during authentication: {e}") from e
         except Exception as e:
-            raise IstaVdmAuthError(f"Authentication error: {e}") from e
+            raise IstaVdmError(f"Authentication error: {e}") from e
 
     async def _get_user_info(self) -> None:
         """Get user and flat information from the portal."""
@@ -269,8 +296,10 @@ class IstaVdmAPI:
                         self._user_id = await self._extract_user_id_from_profile()
                 else:
                     raise IstaVdmError("No flats found for this user")
+            elif response.status in (401, 403):
+                raise IstaVdmAuthError(f"Failed to get user info: {response.status}")
             else:
-                raise IstaVdmError(f"Failed to get user info: {response.status}")
+                raise _status_error(response.status, f"Failed to get user info: {response.status}")
 
         _LOGGER.debug(f"Flat ID: {self._flat_id}, User ID: {self._user_id}")
 
@@ -327,6 +356,24 @@ class IstaVdmAPI:
             return str(flat_id)
         return self._flat_id
 
+    async def _with_relogin(
+        self, request: Callable[[str | None], Awaitable[_T]], flat_id: str | None
+    ) -> _T:
+        """Run a request and log in once more if the portal rejected the session token.
+
+        A request that gets HTTP 401 clears the tokens. Then the session token has
+        expired, not the password, so the request is retried after a new login with
+        the stored credentials. A rejected password still raises IstaVdmAuthError.
+        """
+        had_token = self._access_token is not None
+        try:
+            return await request(flat_id)
+        except IstaVdmAuthError:
+            if not had_token or self._access_token is not None:
+                raise
+            _LOGGER.debug("Session token was rejected, logging in again")
+            return await request(flat_id)
+
     async def get_flat_info(self, flat_id: str | None = None) -> dict | None:
         """Get flat information (address, square meters, etc.).
 
@@ -337,8 +384,12 @@ class IstaVdmAPI:
             Dictionary with flat details or None
 
         Raises:
-            IstaVdmAuthError: If authentication is required
+            IstaVdmAuthError: If the portal rejects the credentials
         """
+        return await self._with_relogin(self._get_flat_info, flat_id)
+
+    async def _get_flat_info(self, flat_id: str | None) -> dict | None:
+        """Get flat information without retrying after an expired session token."""
         await self._ensure_token_valid()
 
         flat_id = self._resolve_flat_id(flat_id)
@@ -423,8 +474,13 @@ class IstaVdmAPI:
 
         Raises:
             IstaVdmError: If data retrieval fails
-            IstaVdmAuthError: If authentication is required
+            IstaVdmConnectionError: If the portal cannot be reached or has a server error
+            IstaVdmAuthError: If the portal rejects the credentials
         """
+        return await self._with_relogin(self._get_consumption_data, flat_id)
+
+    async def _get_consumption_data(self, flat_id: str | None) -> list[ConsumptionData]:
+        """Get consumption data without retrying after an expired session token."""
         await self._ensure_token_valid()
 
         flat_id = self._resolve_flat_id(flat_id)
@@ -446,7 +502,9 @@ class IstaVdmAPI:
                     self._refresh_token = None
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
-                    raise IstaVdmError(f"Failed to get flat details: {response.status}")
+                    raise _status_error(
+                        response.status, f"Failed to get flat details: {response.status}"
+                    )
 
                 flat_data = await response.json()
                 _LOGGER.debug(f"Flat data: {flat_data}")
@@ -477,7 +535,7 @@ class IstaVdmAPI:
                     # Sometimes the export might be returned directly
                     download_url = export_url
                 else:
-                    raise IstaVdmError(f"Failed to get export: {response.status}")
+                    raise _status_error(response.status, f"Failed to get export: {response.status}")
 
             # Step 3: Download the CSV data
             if not download_url:
@@ -491,7 +549,9 @@ class IstaVdmAPI:
                     self._refresh_token = None
                     raise IstaVdmAuthError("Token expired or invalid, re-authentication required")
                 if response.status != 200:
-                    raise IstaVdmError(f"Failed to download CSV: {response.status}")
+                    raise _status_error(
+                        response.status, f"Failed to download CSV: {response.status}"
+                    )
 
                 csv_content = await response.text()
                 _LOGGER.debug(f"CSV content length: {len(csv_content)}")
@@ -500,10 +560,10 @@ class IstaVdmAPI:
             # Step 4: Parse the CSV
             return self._parse_csv(csv_content)
 
-        except IstaVdmAuthError:
+        except (IstaVdmAuthError, IstaVdmError):
             raise
-        except aiohttp.ClientError as e:
-            raise IstaVdmError(f"Network error: {e}") from e
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise IstaVdmConnectionError(f"Network error: {e}") from e
         except Exception as e:
             _LOGGER.exception(f"Error getting consumption data: {e}")
             raise IstaVdmError(f"Error getting consumption data: {e}") from e
